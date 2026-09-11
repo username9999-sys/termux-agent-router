@@ -68,11 +68,20 @@ the local proxy:
 tar chat --session kerja "Ringkas perubahan hari ini"
 tar chat --session kerja "Lanjutkan dari konteks sebelumnya"
 tar chat --new "Mulai sesi baru"
+tar chat --tools --session kerja "Periksa perubahan kode saya"
 ```
 
 Nama sesi hanya menerima karakter alfanumerik, `.`, `_`, dan `-`; API key tidak
 pernah disimpan atau dikirim ke client. Model dapat dipilih dengan
 `--model MODEL`.
+
+Dengan `--tools`, chat berjalan sebagai agent loop terbatas. Model hanya dapat
+meminta `pwd`, `list`, `read`, dan `git_diff`; tidak ada eksekusi shell umum.
+`--max-iterations` membatasi jumlah putaran (default 8, maksimum 32):
+
+```sh
+tar chat --tools --max-iterations 4 "Baca README lalu jelaskan project ini"
+```
 
 ## Tool aman / Safe tools
 

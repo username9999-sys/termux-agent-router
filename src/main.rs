@@ -64,6 +64,10 @@ struct ChatArgs {
     new: bool,
     #[arg(long)]
     model: Option<String>,
+    #[arg(long)]
+    tools: bool,
+    #[arg(long, default_value_t = 8)]
+    max_iterations: usize,
     #[arg(required = true, trailing_var_arg = true)]
     prompt: Vec<String>,
 }
@@ -486,25 +490,70 @@ async fn chat_client(args: ChatArgs) -> Result<()> {
         content: prompt,
     });
     let model = args.model.or_else(|| Some(config.default_model.clone()));
-    let request = json!({"model": model, "messages": session.messages});
+    let mut messages: Vec<Value> = session
+        .messages
+        .iter()
+        .map(|message| json!({"role": message.role, "content": message.content}))
+        .collect();
+    let tools = args.tools.then(safe_tool_definitions);
+    let mut answer = None;
+    let max_iterations = args.max_iterations.clamp(1, 32);
+    let client = Client::new();
     let url = format!(
         "http://{}:{}/v1/chat/completions",
         config.listen_host, config.listen_port
     );
-    let response: Value = Client::new()
-        .post(url)
-        .json(&request)
-        .send()
-        .await?
-        .json()
-        .await?;
-    if let Some(error) = response.get("error") {
-        return Err(anyhow!("proxy error: {error}"));
+    for _ in 0..max_iterations {
+        let mut request = json!({"model": model, "messages": messages});
+        if let Some(tool_definitions) = &tools {
+            request["tools"] = tool_definitions.clone();
+            request["tool_choice"] = json!("auto");
+        }
+        let response: Value = client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()
+            .context("proxy request failed")?
+            .json()
+            .await?;
+        if let Some(error) = response.get("error") {
+            return Err(anyhow!("proxy error: {error}"));
+        }
+        let message = response["choices"][0]["message"].clone();
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        messages.push(message);
+        if tool_calls.is_empty() {
+            answer = content;
+            break;
+        }
+        for call in tool_calls {
+            let id = call["id"].as_str().unwrap_or("tool-call");
+            let name = call["function"]["name"].as_str().unwrap_or_default();
+            let arguments = call["function"]["arguments"].as_str().unwrap_or("{}");
+            let path = serde_json::from_str::<Value>(arguments)
+                .ok()
+                .and_then(|value| value["path"].as_str().map(str::to_owned));
+            let result = run_allowlisted_tool(name, path.as_deref())
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| format!("tool error: {error}"));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": result,
+            }));
+        }
     }
-    let answer = response["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| anyhow!("proxy response did not contain assistant content"))?
-        .to_owned();
+    let answer = answer.ok_or_else(|| anyhow!("agent loop reached max iterations"))?;
     session.messages.push(ChatMessage {
         role: "assistant".into(),
         content: answer.clone(),
@@ -513,6 +562,52 @@ async fn chat_client(args: ChatArgs) -> Result<()> {
     fs::write(path, serde_json::to_string_pretty(&session)?)?;
     println!("{answer}");
     Ok(())
+}
+
+fn safe_tool_definitions() -> Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "pwd",
+                "description": "Return the current workspace path.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list",
+                "description": "List entries in a workspace-relative directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a workspace-relative text file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "git_diff",
+                "description": "Return the current git diff without executing a shell.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+            }
+        }
+    ])
 }
 
 #[cfg(test)]
@@ -579,6 +674,18 @@ mod tests {
     fn tools_reject_paths_outside_workspace_and_unknown_commands() {
         assert!(run_allowlisted_tool("unknown", None).is_err());
         assert!(run_allowlisted_tool("read", Some("../Cargo.toml")).is_err());
+    }
+
+    #[test]
+    fn tool_definitions_are_allowlisted() {
+        let tools = safe_tool_definitions();
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["pwd", "list", "read", "git_diff"]);
     }
 
     #[test]
