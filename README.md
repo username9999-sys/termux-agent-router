@@ -57,6 +57,36 @@ Environment `OPENAI_BASE_URL`, `OPENAI_API_BASE`, dan
 `TERMUX_AGENT_ROUTER_BASE_URL` diarahkan ke proxy lokal. `OPENAI_API_KEY` diisi
 dengan placeholder lokal; key provider tetap dibaca oleh proxy dari environment.
 
+## Chat persisten / Persistent chat
+
+Subcommand `chat` menyimpan pesan lokal sebagai JSON di XDG data directory
+(`~/.local/share/termux-agent-router/sessions/`). / The `chat` command keeps
+conversation history locally and sends only the selected model and messages to
+the local proxy:
+
+```sh
+tar chat --session kerja "Ringkas perubahan hari ini"
+tar chat --session kerja "Lanjutkan dari konteks sebelumnya"
+tar chat --new "Mulai sesi baru"
+```
+
+Nama sesi hanya menerima karakter alfanumerik, `.`, `_`, dan `-`; API key tidak
+pernah disimpan atau dikirim ke client. Model dapat dipilih dengan
+`--model MODEL`.
+
+## Tool aman / Safe tools
+
+Endpoint lokal `POST /v1/tools` hanya menyediakan operasi allowlist: `pwd`,
+`list`, `read`, dan `git_diff`. Operasi file dibatasi pada workspace router,
+path traversal ditolak, dan `git diff` dijalankan tanpa shell. Tidak ada
+endpoint arbitrary command atau agent loop yang dapat mengeksekusi perintah
+destruktif.
+
+Konsepnya terinspirasi workflow Hermes (session memory, tool permissions, dan
+provider routing), tetapi implementasi ini mandiri. / It intentionally does
+not copy Hermes source code, branding, prompt, skills, or unrestricted
+execution model.
+
 ## Pengembangan
 
 ```sh

@@ -4,7 +4,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderValue, StatusCode, header},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use clap::{Args, Parser, Subcommand};
@@ -12,7 +12,14 @@ use directories::BaseDirs;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{env, path::PathBuf, process::Command, sync::Arc};
+use std::{
+    collections::HashSet,
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -38,6 +45,7 @@ enum Commands {
         #[arg(required = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
+    Chat(ChatArgs),
 }
 
 #[derive(Args, Debug)]
@@ -46,6 +54,18 @@ struct ServeArgs {
     host: Option<String>,
     #[arg(long)]
     port: Option<u16>,
+}
+
+#[derive(Args, Debug)]
+struct ChatArgs {
+    #[arg(long, default_value = "default")]
+    session: String,
+    #[arg(long)]
+    new: bool,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(required = true, trailing_var_arg = true)]
+    prompt: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -85,12 +105,18 @@ fn default_port() -> u16 {
 impl Config {
     fn candidates<'a>(&'a self, requested: Option<&'a str>) -> Vec<&'a str> {
         let mut models = Vec::new();
-        if let Some(model) = requested.filter(|model| !model.is_empty()) {
-            models.push(model);
-        } else if !self.default_model.is_empty() {
-            models.push(self.default_model.as_str());
+        let mut seen = HashSet::new();
+        let first = requested
+            .filter(|model| !model.is_empty())
+            .or_else(|| (!self.default_model.is_empty()).then_some(self.default_model.as_str()));
+        for model in first
+            .into_iter()
+            .chain(self.fallback_models.iter().map(String::as_str))
+        {
+            if seen.insert(model) {
+                models.push(model);
+            }
         }
-        models.extend(self.fallback_models.iter().map(String::as_str));
         models
     }
 
@@ -120,6 +146,7 @@ async fn main() -> Result<()> {
             port,
             command,
         } => run_client(host, port, command),
+        Commands::Chat(args) => chat_client(args).await,
     }
 }
 
@@ -136,10 +163,45 @@ fn load_config() -> Result<Config> {
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read config {}", path.display()))?;
     let config: Config = toml::from_str(&text).context("parse config TOML")?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<()> {
     if config.providers.is_empty() {
         return Err(anyhow!("config must contain at least one provider"));
     }
-    Ok(config)
+    if config.default_model.trim().is_empty() {
+        return Err(anyhow!("default_model must not be empty"));
+    }
+    let mut ids = HashSet::new();
+    let mut models = HashSet::new();
+    for provider in &config.providers {
+        if provider.id.trim().is_empty()
+            || provider.model.trim().is_empty()
+            || provider.api_key_env.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "provider id, model, and api_key_env must not be empty"
+            ));
+        }
+        if !ids.insert(&provider.id) || !models.insert(&provider.model) {
+            return Err(anyhow!("provider ids and models must be unique"));
+        }
+        let scheme = reqwest::Url::parse(&provider.base_url)
+            .with_context(|| format!("invalid provider URL for {}", provider.id))?
+            .scheme()
+            .to_owned();
+        if scheme != "http" && scheme != "https" {
+            return Err(anyhow!("provider URL must use http or https"));
+        }
+    }
+    for model in std::iter::once(&config.default_model).chain(config.fallback_models.iter()) {
+        if !models.contains(model) {
+            return Err(anyhow!("configured model has no provider: {model}"));
+        }
+    }
+    Ok(())
 }
 
 fn init_config() -> Result<()> {
@@ -200,11 +262,68 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/tools", post(run_tool))
         .with_state(state)
 }
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolRequest {
+    name: String,
+    path: Option<String>,
+}
+
+async fn run_tool(Json(request): Json<ToolRequest>) -> Response {
+    match run_allowlisted_tool(&request.name, request.path.as_deref()) {
+        Ok(output) => (StatusCode::OK, Json(json!({"result": output}))).into_response(),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+    }
+}
+
+fn run_allowlisted_tool(name: &str, requested_path: Option<&str>) -> Result<String> {
+    let root = env::current_dir()?;
+    match name {
+        "pwd" => Ok(root.display().to_string()),
+        "list" => {
+            let path = safe_path(&root, requested_path.unwrap_or("."))?;
+            let mut entries = fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            entries.sort();
+            Ok(entries.join("\n"))
+        }
+        "read" => {
+            let path = safe_path(
+                &root,
+                requested_path.ok_or_else(|| anyhow!("read requires path"))?,
+            )?;
+            Ok(fs::read_to_string(path)?)
+        }
+        "git_diff" => {
+            let output = Command::new("git")
+                .args(["diff", "--no-ext-diff", "--"])
+                .current_dir(root)
+                .output()
+                .context("run git diff")?;
+            if !output.status.success() {
+                return Err(anyhow!("git diff failed"));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        _ => Err(anyhow!("tool not allowed: {name}")),
+    }
+}
+
+fn safe_path(root: &Path, requested: &str) -> Result<PathBuf> {
+    let path = root.join(requested);
+    let canonical = path.canonicalize().context("path does not exist")?;
+    if !canonical.starts_with(root.canonicalize()?) {
+        return Err(anyhow!("path escapes router workspace"));
+    }
+    Ok(canonical)
 }
 
 async fn chat_completions(
@@ -315,6 +434,87 @@ fn run_client(host: Option<String>, port: Option<u16>, command: Vec<String>) -> 
     std::process::exit(status.code().unwrap_or(1));
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct Session {
+    messages: Vec<ChatMessage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+fn sessions_dir() -> Result<PathBuf> {
+    let dirs = BaseDirs::new().ok_or_else(|| anyhow!("cannot determine data directory"))?;
+    Ok(dirs.data_dir().join("termux-agent-router").join("sessions"))
+}
+
+fn session_path(id: &str) -> Result<PathBuf> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    {
+        return Err(anyhow!("invalid session name"));
+    }
+    Ok(sessions_dir()?.join(format!("{id}.json")))
+}
+
+async fn chat_client(args: ChatArgs) -> Result<()> {
+    let config = load_config()?;
+    let session_id = if args.new {
+        format!(
+            "session-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        )
+    } else {
+        args.session
+    };
+    let path = session_path(&session_id)?;
+    let mut session: Session = if args.new || !path.exists() {
+        Session::default()
+    } else {
+        serde_json::from_str(&fs::read_to_string(&path)?)?
+    };
+    let prompt = args.prompt.join(" ");
+    if prompt.trim().is_empty() {
+        return Err(anyhow!("prompt must not be empty"));
+    }
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: prompt,
+    });
+    let model = args.model.or_else(|| Some(config.default_model.clone()));
+    let request = json!({"model": model, "messages": session.messages});
+    let url = format!(
+        "http://{}:{}/v1/chat/completions",
+        config.listen_host, config.listen_port
+    );
+    let response: Value = Client::new()
+        .post(url)
+        .json(&request)
+        .send()
+        .await?
+        .json()
+        .await?;
+    if let Some(error) = response.get("error") {
+        return Err(anyhow!("proxy error: {error}"));
+    }
+    let answer = response["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow!("proxy response did not contain assistant content"))?
+        .to_owned();
+    session.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: answer.clone(),
+    });
+    fs::create_dir_all(sessions_dir()?)?;
+    fs::write(path, serde_json::to_string_pretty(&session)?)?;
+    println!("{answer}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,10 +549,7 @@ mod tests {
     fn selects_requested_then_default_and_fallback() {
         let config = test_config();
         assert_eq!(config.candidates(None), vec!["one-model", "two-model"]);
-        assert_eq!(
-            config.candidates(Some("two-model")),
-            vec!["two-model", "two-model"]
-        );
+        assert_eq!(config.candidates(Some("two-model")), vec!["two-model"]);
         assert_eq!(config.provider_for("two-model").unwrap().id, "two");
     }
 
@@ -369,5 +566,25 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), br#"{"status":"ok"}"#);
+    }
+
+    #[test]
+    fn session_names_cannot_traverse_directories() {
+        assert!(session_path("../escape").is_err());
+        assert!(session_path("work/session").is_err());
+        assert!(session_path("safe_session-1").is_ok());
+    }
+
+    #[test]
+    fn tools_reject_paths_outside_workspace_and_unknown_commands() {
+        assert!(run_allowlisted_tool("unknown", None).is_err());
+        assert!(run_allowlisted_tool("read", Some("../Cargo.toml")).is_err());
+    }
+
+    #[test]
+    fn config_validation_rejects_missing_model_provider() {
+        let mut config = test_config();
+        config.fallback_models = vec!["missing".into()];
+        assert!(validate_config(&config).is_err());
     }
 }
